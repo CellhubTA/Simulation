@@ -1,0 +1,10 @@
+Campaign report,,,,,,,,,,,,,,,,,,,
+"July 27, 2026 - August 5, 2026",,,,,,,,,,,,,,,,,,,
+Campaign,Budget type,Currency code,Campaign type,Cost,Bid strategy type,Impr.,TrueView views,TrueView view rate (In-stream),TrueView view rate (In-feed),TrueView view rate (Shorts),Avg. CPM,TrueView avg. CPV,Clicks,CTR,Video played to 25%,Video played to 50%,Video played to 75%,Video played to 100%,Unique users
+Campaign1,Daily,VND,Video,2615475,Target CPM,"101,597",920, --, --,0.91%,25744,2843,31,0.03%,2.33%,1.03%,0.65%,0.42%,"112,432"
+Campaign2,Daily,VND,Video,2629923,Target CPM,"99,168","1,047", --, --,1.06%,26520,2512,21,0.02%,2.62%,1.24%,0.79%,0.51%,"99,037"
+Campaign3,Daily,VND,Video,21929103,Target CPM,"634,591","22,473",30.57%, --,1.46%,34556,976,314,0.05%,10.19%,4.67%,3.42%,2.79%,"495,992"
+Campaign4,Daily,VND,Video,36641055,Target CPM,"727,007","51,830",27.89%, --,1.66%,50400,707,402,0.06%,22.99%,10.13%,7.53%,6.34%,"595,085"
+Campaign5,Daily,VND,Video,2112256,Target CPM,"70,814","1,308",30.10%, --,1.17%,29828,1615,9,0.01%,5.20%,2.36%,1.66%,1.29%,"70,432"
+Campaign6,Daily,VND,Video,346055,Target CPM,"5,108",53, --, --,1.04%,67748,6529,3,0.06%,2.74%,1.19%,0.76%,0.47%,"5,650"
+Campaign7,Daily,VND,Video,2299235,Target CPM,"74,220","2,150",45.46%, --,1.24%,30979,1069,17,0.02%,6.60%,3.53%,2.74%,2.30%,"80,117"
