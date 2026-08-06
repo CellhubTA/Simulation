@@ -67,38 +67,7 @@ uploaded_file = st.sidebar.file_uploader(
     "Campaign report CSV", type=["csv"], help="Google Ads / DV360-style campaign export"
 )
 
-st.sidebar.header("2. Currency conversion")
-source_currency = st.sidebar.text_input("Source currency (in the file)", value="VND")
-target_currency = st.sidebar.text_input("Target currency", value="JPY")
-
-fx_mode = st.sidebar.radio("FX rate source", ["Fetch live rate", "Enter manually"], index=1)
-
-if fx_mode == "Fetch live rate":
-    if st.sidebar.button("Fetch live rate now"):
-        rate, source_label = du.fetch_live_fx_rate(source_currency, target_currency)
-        if rate is not None:
-            st.session_state["fx_rate"] = rate
-            st.session_state["fx_source"] = source_label
-        else:
-            st.sidebar.warning(f"Live fetch failed: {source_label}. Falling back to manual entry.")
-    fx_rate = st.session_state.get("fx_rate", du.FALLBACK_VND_TO_JPY)
-    fx_source = st.session_state.get("fx_source", "not yet fetched (using fallback constant)")
-    st.sidebar.caption(f"Current rate: 1 {source_currency} = {fx_rate:.6f} {target_currency}  ·  {fx_source}")
-else:
-    fx_rate = st.sidebar.number_input(
-        f"1 {source_currency} = ? {target_currency}",
-        min_value=0.0,
-        value=float(st.session_state.get("fx_rate", du.FALLBACK_VND_TO_JPY)),
-        format="%.6f",
-    )
-    st.session_state["fx_rate"] = fx_rate
-    fx_source = "manual override"
-
-st.sidebar.caption(
-    "Note: this environment may not have live internet access when fetching rates. "
-    "If 'Fetch live rate' fails, switch to manual entry -- e.g. check "
-    "google.com/finance or xe.com and type the current rate in."
-)
+CURRENCY_SYMBOLS = {"VND": "₫", "KRW": "₩", "JPY": "¥", "USD": "$"}
 
 # --------------------------------------------------------------------------
 # Main
@@ -117,6 +86,8 @@ if uploaded_file is None:
         **Expected format:** a Google Ads / DV360-style campaign report export with columns such as
         `Campaign`, `Currency code`, `Campaign type`, `Cost`, `Bid strategy type`, `Impr.`,
         `TrueView views`, `Avg. CPM`, `Clicks`, `CTR`, `Video played to 25/50/75/100%`, `Unique users`.
+        Supported source currencies: VND, KRW, JPY, USD -- a file can even mix
+        several (each row is converted using its own `Currency code`).
         """
     )
     st.stop()
@@ -126,6 +97,71 @@ try:
 except Exception as e:
     st.error(f"Couldn't read this file: {e}")
     st.stop()
+
+# --------------------------------------------------------------------------
+# Currency conversion -- resolved per currency actually present in the file
+# --------------------------------------------------------------------------
+st.sidebar.header("2. Currency conversion")
+
+currencies_in_file = sorted(raw_df["Currency code"].dropna().unique().tolist())
+unsupported = [c for c in currencies_in_file if c not in du.SUPPORTED_CURRENCIES]
+if unsupported:
+    st.sidebar.warning(
+        f"File contains currency code(s) not in the supported list: {unsupported}. "
+        f"Supported: {du.SUPPORTED_CURRENCIES}. Rows in an unsupported currency "
+        "will show as n/a until you add a rate for them."
+    )
+
+target_currency = st.sidebar.selectbox(
+    "Target currency", du.SUPPORTED_CURRENCIES, index=du.SUPPORTED_CURRENCIES.index("JPY")
+)
+fx_mode = st.sidebar.radio("FX rate source", ["Fetch live rates", "Enter manually"], index=1)
+
+st.sidebar.caption(f"Currencies found in file: {', '.join(currencies_in_file) or 'none'}")
+
+manual_overrides = {}
+fx_rates = {}
+fx_sources = {}
+
+if fx_mode == "Fetch live rates":
+    if st.sidebar.button("Fetch live rates now"):
+        fetched = du.get_fx_rates_for_currencies(currencies_in_file, target_currency)
+        st.session_state["fx_rates"] = {cur: rate for cur, (rate, _) in fetched.items() if rate is not None}
+        st.session_state["fx_sources"] = {cur: src for cur, (rate, src) in fetched.items()}
+    fx_rates = st.session_state.get("fx_rates", {})
+    fx_sources = st.session_state.get("fx_sources", {})
+    for cur in currencies_in_file:
+        rate = fx_rates.get(cur)
+        src = fx_sources.get(cur, "not yet fetched")
+        if rate is not None:
+            st.sidebar.caption(f"1 {cur} = {rate:.6f} {target_currency}  ·  {src}")
+        else:
+            st.sidebar.caption(f"⚠️ {cur}: {src}")
+else:
+    st.sidebar.caption("Enter the rate for each currency found in the file:")
+    for cur in currencies_in_file:
+        default_rate = du.FALLBACK_RATES_TO_JPY.get(cur, 1.0) if target_currency == "JPY" else (
+            1.0 if cur == target_currency else 0.0
+        )
+        key = f"fx_manual_{cur}_{target_currency}"
+        rate_input = st.sidebar.number_input(
+            f"1 {cur} = ? {target_currency}",
+            min_value=0.0,
+            value=float(st.session_state.get(key, default_rate)),
+            format="%.6f",
+            key=key,
+        )
+        manual_overrides[cur] = rate_input
+        fx_rates[cur] = rate_input
+        fx_sources[cur] = "manual"
+
+st.sidebar.caption(
+    "Note: this environment may not have live internet access when fetching rates. "
+    "If 'Fetch live rates' fails, switch to manual entry -- e.g. check "
+    "google.com/finance or xe.com and type the current rate in."
+)
+
+
 
 # --------------------------------------------------------------------------
 # Audience tagging
@@ -161,8 +197,17 @@ raw_df = raw_df.merge(
 raw_df["Audience"] = raw_df["Audience_tagged"].fillna(raw_df["Audience"])
 raw_df = raw_df.drop(columns=["Audience_tagged"])
 
-df_jpy = du.add_jpy_columns(raw_df, fx_rate, cost_currency=source_currency)
-benchmarks = du.compute_benchmarks(df_jpy)
+sym = CURRENCY_SYMBOLS.get(target_currency, target_currency + " ")
+
+df_conv = du.add_converted_columns(raw_df, fx_rates, target_currency=target_currency)
+cost_col = f"Cost ({target_currency})"
+missing_fx = df_conv.attrs.get("missing_fx_currencies", [])
+if missing_fx:
+    st.warning(
+        f"No FX rate set for: {missing_fx}. Those campaigns will show n/a for converted "
+        "values -- add a rate for them in the sidebar."
+    )
+benchmarks = du.compute_benchmarks(df_conv, cost_col=cost_col)
 
 if benchmarks.empty:
     st.error("No usable rows found after cleaning -- check the uploaded file.")
@@ -184,8 +229,8 @@ with tab_data:
     st.dataframe(raw_df, use_container_width=True)
 
     st.subheader(f"Cost converted to {target_currency}")
-    show_cols = [c for c in ["Campaign", "Campaign type", "Bid strategy type", "Cost", "Cost (JPY)"] if c in df_jpy.columns]
-    st.dataframe(df_jpy[show_cols], use_container_width=True)
+    show_cols = [c for c in ["Campaign", "Currency code", "Campaign type", "Bid strategy type", "Cost", cost_col] if c in df_conv.columns]
+    st.dataframe(df_conv[show_cols], use_container_width=True)
 
     st.subheader("Historical benchmark rates by channel & bid strategy")
     st.caption("Weighted by impressions/cost across all campaigns in each segment.")
@@ -207,8 +252,8 @@ with tab_budget:
         budget_input = st.number_input(f"Budget ({target_currency})", min_value=0.0, value=50000.0, step=1000.0)
     with col2:
         row = benchmarks.loc[benchmarks["segment_label"] == seg_label].iloc[0]
-        st.metric("Historical eCPM", f"¥{row['ecpm_jpy']:.2f}" if pd.notna(row["ecpm_jpy"]) else "n/a")
-        st.metric("Historical CPV", f"¥{row['cpv_jpy']:.2f}" if pd.notna(row["cpv_jpy"]) else "n/a")
+        st.metric("Historical eCPM", f"{sym}{row['ecpm_jpy']:.2f}" if pd.notna(row["ecpm_jpy"]) else "n/a")
+        st.metric("Historical CPV", f"{sym}{row['cpv_jpy']:.2f}" if pd.notna(row["cpv_jpy"]) else "n/a")
         st.metric("Historical CTR", f"{row['ctr']*100:.3f}%" if pd.notna(row["ctr"]) else "n/a")
 
     result = sim.simulate_from_budget(row.to_dict(), budget_input)
@@ -231,10 +276,10 @@ with tab_budget:
 
     st.markdown("### Implied buying rates at this budget")
     r1, r2, r3, r4 = st.columns(4)
-    r1.metric("eCPM", f"¥{result.ecpm_jpy:,.2f}" if pd.notna(result.ecpm_jpy) else "n/a")
-    r2.metric("CPC", f"¥{result.cpc_jpy:,.2f}" if pd.notna(result.cpc_jpy) else "n/a")
-    r3.metric("CPV", f"¥{result.cpv_jpy:,.2f}" if pd.notna(result.cpv_jpy) else "n/a")
-    r4.metric("CPCV", f"¥{result.cpcv_jpy:,.2f}" if pd.notna(result.cpcv_jpy) else "n/a")
+    r1.metric("eCPM", f"{sym}{result.ecpm_jpy:,.2f}" if pd.notna(result.ecpm_jpy) else "n/a")
+    r2.metric("CPC", f"{sym}{result.cpc_jpy:,.2f}" if pd.notna(result.cpc_jpy) else "n/a")
+    r3.metric("CPV", f"{sym}{result.cpv_jpy:,.2f}" if pd.notna(result.cpv_jpy) else "n/a")
+    r4.metric("CPCV", f"{sym}{result.cpcv_jpy:,.2f}" if pd.notna(result.cpcv_jpy) else "n/a")
 
     st.markdown("### How eCPM shifts as spend increases")
     if row.get("has_ecpm_curve"):
@@ -276,7 +321,7 @@ with tab_target:
         st.warning(w)
 
     st.markdown("### Required budget")
-    st.metric(f"Budget needed ({target_currency})", f"¥{result_t.budget_jpy:,.0f}" if pd.notna(result_t.budget_jpy) else "n/a")
+    st.metric(f"Budget needed ({target_currency})", f"{sym}{result_t.budget_jpy:,.0f}" if pd.notna(result_t.budget_jpy) else "n/a")
 
     st.markdown("### Full projected delivery at that budget")
     m1, m2, m3, m4 = st.columns(4)
@@ -326,7 +371,7 @@ with tab_planner:
             totals = res_df[["budget_jpy", "impressions", "clicks", "trueview_views", "video_100", "unique_users"]].sum()
             st.markdown("### Totals across all channels")
             t1, t2, t3, t4 = st.columns(4)
-            t1.metric("Total Budget", f"¥{totals['budget_jpy']:,.0f}")
+            t1.metric("Total Budget", f"{sym}{totals['budget_jpy']:,.0f}")
             t2.metric("Total Impressions", f"{totals['impressions']:,.0f}")
             t3.metric("Total Clicks", f"{totals['clicks']:,.0f}")
             t4.metric("Total Unique Users", f"{totals['unique_users']:,.0f}")

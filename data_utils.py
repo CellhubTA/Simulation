@@ -192,18 +192,30 @@ def load_campaign_csv(file_or_path) -> pd.DataFrame:
 # Currency conversion
 # --------------------------------------------------------------------------
 
-# Fallback rate used if a live rate can't be fetched (no internet, API
-# down, etc). Update this periodically -- it's only a safety net.
-FALLBACK_VND_TO_JPY = 0.0061  # approx JPY per 1 VND
+# Currencies supported in the app's dropdowns. "Other" lets a user type a
+# custom ISO code if they need one that isn't listed.
+SUPPORTED_CURRENCIES = ["VND", "KRW", "JPY", "USD"]
+
+# Fallback rates used if a live rate can't be fetched (no internet, API
+# down, etc). Units: JPY per 1 unit of source currency. Update periodically
+# -- these are only a safety net, not meant to be precise.
+FALLBACK_RATES_TO_JPY = {
+    "VND": 0.0061,
+    "KRW": 0.11,
+    "USD": 150.0,
+    "JPY": 1.0,
+}
 
 
-def fetch_live_fx_rate(base: str = "VND", target: str = "JPY") -> tuple[float | None, str]:
+def fetch_live_fx_rate(base: str, target: str) -> tuple[float | None, str]:
     """
     Try to fetch a live FX rate (units of `target` per 1 unit of `base`).
     Returns (rate, source_description). rate is None if the fetch failed
     (e.g. no network access in this environment) -- caller should fall
     back to a manual/default rate in that case.
     """
+    if base == target:
+        return 1.0, "same currency"
     if requests is None:
         return None, "requests library not available"
     try:
@@ -221,23 +233,74 @@ def fetch_live_fx_rate(base: str = "VND", target: str = "JPY") -> tuple[float | 
     return None, "rate not found in response"
 
 
-def get_fx_rate(base: str = "VND", target: str = "JPY", manual_override: float | None = None):
+def get_fx_rate(base: str, target: str, manual_override: float | None = None):
     """
-    Returns (rate, source_label). If manual_override is given, uses that.
-    Otherwise attempts a live fetch, falling back to a hardcoded constant.
+    Returns (rate, source_label) for a single currency pair. If
+    manual_override is given, uses that. Otherwise attempts a live fetch,
+    falling back to a hardcoded constant.
     """
     if manual_override is not None:
         return manual_override, "manual override"
     rate, source = fetch_live_fx_rate(base, target)
     if rate is not None:
         return rate, source
-    return FALLBACK_VND_TO_JPY, f"fallback constant ({source})"
+    fallback = FALLBACK_RATES_TO_JPY.get(base)
+    if fallback is not None and target == "JPY":
+        return fallback, f"fallback constant ({source})"
+    return None, f"no rate available ({source})"
+
+
+def get_fx_rates_for_currencies(
+    currencies: list[str], target: str, manual_overrides: dict[str, float] | None = None
+) -> dict[str, tuple[float, str]]:
+    """
+    Fetch/resolve a rate for each currency in `currencies` -> `target`.
+    manual_overrides: optional dict of {currency: rate} to force specific
+    currencies to a manual rate instead of fetching live.
+    Returns {currency: (rate, source_label)}.
+    """
+    manual_overrides = manual_overrides or {}
+    results = {}
+    for cur in currencies:
+        override = manual_overrides.get(cur)
+        results[cur] = get_fx_rate(cur, target, manual_override=override)
+    return results
+
+
+def add_converted_columns(
+    df: pd.DataFrame,
+    fx_rates: dict[str, float],
+    target_currency: str = "JPY",
+    currency_col: str = "Currency code",
+) -> pd.DataFrame:
+    """
+    Adds target-currency-converted cost/rate columns, converting each row
+    using its OWN currency (from `currency_col`) and the matching rate in
+    `fx_rates` (a dict of {currency_code: rate_to_target}). This supports
+    files where different campaigns are booked in different currencies.
+
+    Rows whose currency isn't in `fx_rates` get NaN for the converted
+    columns (rather than silently using the wrong rate).
+    """
+    df = df.copy()
+    row_rate = df[currency_col].map(fx_rates)
+    missing = df.loc[row_rate.isna(), currency_col].unique()
+    df[f"FX Rate (to {target_currency})"] = row_rate
+    df[f"Cost ({target_currency})"] = df["Cost"] * row_rate
+    if "Avg. CPM" in df.columns:
+        df[f"Avg. CPM ({target_currency})"] = df["Avg. CPM"] * row_rate
+    if "TrueView avg. CPV" in df.columns:
+        df[f"TrueView avg. CPV ({target_currency})"] = df["TrueView avg. CPV"] * row_rate
+    df.attrs["missing_fx_currencies"] = list(missing)
+    return df
 
 
 def add_jpy_columns(df: pd.DataFrame, fx_rate: float, cost_currency: str = "VND") -> pd.DataFrame:
     """
-    Adds JPY-converted cost/rate columns based on the given fx_rate
-    (units of JPY per 1 unit of cost_currency). Leaves original columns intact.
+    Backwards-compatible single-currency conversion (assumes the whole
+    file is in `cost_currency`). Prefer add_converted_columns() for files
+    that may mix currencies -- this is kept for simplicity when a caller
+    already knows the whole file is one currency.
     """
     df = df.copy()
     df["FX Rate (to JPY)"] = fx_rate
@@ -247,6 +310,8 @@ def add_jpy_columns(df: pd.DataFrame, fx_rate: float, cost_currency: str = "VND"
     if "TrueView avg. CPV" in df.columns:
         df["TrueView avg. CPV (JPY)"] = df["TrueView avg. CPV"] * fx_rate
     return df
+
+
 
 
 # --------------------------------------------------------------------------
@@ -287,25 +352,28 @@ class ChannelBenchmark:
         return self.__dict__
 
 
-def _fit_ecpm_curve(g: pd.DataFrame):
+def _fit_ecpm_curve(g: pd.DataFrame, cost_col: str = "Cost (JPY)"):
     """
     Fit eCPM (per campaign) as a log-linear function of spend:
-        ecpm = intercept + slope * ln(cost_jpy)
+        ecpm = intercept + slope * ln(cost)
     using ordinary least squares on the individual campaigns within a
-    segment. Requires at least 3 campaigns with valid cost & eCPM data to
-    be considered reliable; otherwise returns all-NaN / has_curve=False.
+    segment. `cost_col` should be the cost column already converted into
+    whatever target currency the app is using (its values represent spend
+    in that currency, regardless of the column's literal name).
+    Requires at least 3 campaigns with valid cost & eCPM data to be
+    considered reliable; otherwise returns all-NaN / has_curve=False.
 
     A positive slope means eCPM tends to rise as spend increases (more
     auction pressure at higher budgets); negative means it falls
     (efficiencies of scale). Either is plausible depending on the channel.
     """
-    sub = g.dropna(subset=["Cost (JPY)", "Impr."])
-    sub = sub[(sub["Cost (JPY)"] > 0) & (sub["Impr."] > 0)]
+    sub = g.dropna(subset=[cost_col, "Impr."])
+    sub = sub[(sub[cost_col] > 0) & (sub["Impr."] > 0)]
     if len(sub) < 3:
         return np.nan, np.nan, np.nan, False
 
-    x = np.log(sub["Cost (JPY)"].values)
-    y = (sub["Cost (JPY)"].values / sub["Impr."].values * 1000)  # per-campaign eCPM
+    x = np.log(sub[cost_col].values)
+    y = (sub[cost_col].values / sub["Impr."].values * 1000)  # per-campaign eCPM
 
     if np.std(x) == 0:
         return np.nan, np.nan, np.nan, False
@@ -347,10 +415,16 @@ def _weighted_avg(df, value_col, weight_col):
     return float(np.average(sub[value_col], weights=sub[weight_col]))
 
 
-def compute_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
+def compute_benchmarks(df: pd.DataFrame, cost_col: str = "Cost (JPY)") -> pd.DataFrame:
     """
-    Groups the cleaned+JPY-converted dataframe by (Campaign type, Bid
-    strategy type) and computes weighted-average historical rates.
+    Groups the cleaned + currency-converted dataframe by (Campaign type,
+    Bid strategy type, Audience) and computes weighted-average historical
+    rates. `cost_col` should be the cost column already converted into
+    whatever target currency the app is using -- pass e.g. "Cost (USD)"
+    if that's what add_converted_columns() produced. All resulting rate
+    fields (ecpm_jpy, cpc_jpy, etc.) are expressed in that target currency
+    regardless of the field name (kept as "_jpy" for backward compatibility
+    with existing code -- treat it as "in target currency").
     Returns a tidy dataframe, one row per segment.
     """
     if "Audience" not in df.columns:
@@ -360,7 +434,7 @@ def compute_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     group_cols = ["Campaign type", "Bid strategy type", "Audience"]
     for (seg, strategy, audience), g in df.groupby(group_cols):
-        total_cost = g["Cost (JPY)"].sum()
+        total_cost = g[cost_col].sum()
         total_impr = g["Impr."].sum()
         total_clicks = g["Clicks"].sum() if "Clicks" in g else np.nan
         total_views = g["TrueView views"].sum() if "TrueView views" in g else np.nan
@@ -381,7 +455,7 @@ def compute_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
         completed_views = total_impr * vcr_100 if pd.notna(vcr_100) else np.nan
         cpcv = (total_cost / completed_views) if completed_views else np.nan
 
-        intercept, slope, r2, has_curve = _fit_ecpm_curve(g)
+        intercept, slope, r2, has_curve = _fit_ecpm_curve(g, cost_col=cost_col)
 
         rows.append(
             ChannelBenchmark(

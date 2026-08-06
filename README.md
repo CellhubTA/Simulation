@@ -29,6 +29,16 @@ running the app on **3.11 or 3.12** for now. If you specifically need 3.14
 check current compatibility and adjust — but there's no functional reason
 this app needs 3.14.
 
+## New: multiple currencies (VND, KRW, JPY, USD)
+
+The sidebar now has a **Target currency** dropdown (VND, KRW, JPY, or USD)
+and automatically detects every currency present in your file's
+`Currency code` column. If your file mixes currencies — some campaigns in
+VND, some in USD — each row is converted using **its own currency**, not
+one global rate. You'll get a rate input (or live-fetch) for each currency
+found, and if a rate is missing for one, those rows show `n/a` rather than
+silently using the wrong conversion.
+
 ## New: password, audience targeting, spend-dependent CPM
 
 **1. Password protection**
