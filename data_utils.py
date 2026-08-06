@@ -63,15 +63,6 @@ PERCENT_COLS = [
     "Video played to 100%",
 ]
 
-REQUIRED_COLS = [
-    "Campaign",
-    "Currency code",
-    "Campaign type",
-    "Cost",
-    "Bid strategy type",
-    "Impr.",
-]
-
 BID_STRATEGIES = ["Target CPM", "Target CPV"]
 
 # Preset audience options shown in the app's audience-tagging UI. Freeform
@@ -85,6 +76,210 @@ AUDIENCE_OPTIONS = [
     "Adults 18-34",
     "Adults 35+",
 ]
+
+# --------------------------------------------------------------------------
+# Flexible column mapping
+# --------------------------------------------------------------------------
+# Different exports name the same thing differently (e.g. "Gross Budget" vs
+# "Cost" vs "Spend"). CANONICAL_SCHEMA maps each internal field name to a
+# list of aliases (checked case/punctuation-insensitively) used to
+# auto-detect which uploaded column maps to which internal field.
+#
+# Only fields with required=True must be mapped for the file to be usable;
+# everything else is optional and simply won't contribute to the benchmark
+# if absent (e.g. a file with no video-completion columns just won't have
+# a VCR benchmark -- clicks/impressions/etc. still work fine).
+
+CANONICAL_SCHEMA = {
+    "Campaign": {
+        "aliases": ["campaign", "campaign name", "line item", "ad group", "insertion order"],
+        "required": False,
+        "kind": "text",
+    },
+    "Campaign type": {
+        "aliases": [
+            "campaign type", "partner", "creative format", "channel",
+            "platform", "media type", "publisher",
+        ],
+        "required": True,
+        "kind": "text",
+    },
+    "Currency code": {
+        "aliases": ["currency code", "currency", "curr"],
+        "required": False,
+        "kind": "text",
+    },
+    "Cost": {
+        "aliases": ["cost", "gross budget", "spend", "budget", "net cost", "media cost", "net spend"],
+        "required": True,
+        "kind": "number",
+    },
+    "Bid strategy type": {
+        "aliases": ["bid strategy type", "buying method", "bid strategy", "buy type", "pricing model"],
+        "required": True,
+        "kind": "text",
+    },
+    "Impr.": {
+        "aliases": ["impr.", "impressions", "impr", "delivered impressions"],
+        "required": True,
+        "kind": "number",
+    },
+    "TrueView views": {
+        "aliases": ["trueview views", "views", "video views"],
+        "required": False,
+        "kind": "number",
+    },
+    "Clicks": {
+        "aliases": ["clicks"],
+        "required": False,
+        "kind": "number",
+    },
+    "CTR": {
+        "aliases": ["ctr", "click through rate", "click-through rate"],
+        "required": False,
+        "kind": "percent",
+    },
+    "Video played to 25%": {
+        "aliases": ["video played to 25%", "vcr 25%", "25% completion", "video completions 25%"],
+        "required": False,
+        "kind": "percent",
+    },
+    "Video played to 50%": {
+        "aliases": ["video played to 50%", "vcr 50%", "50% completion", "video completions 50%", "midpoint"],
+        "required": False,
+        "kind": "percent",
+    },
+    "Video played to 75%": {
+        "aliases": ["video played to 75%", "vcr 75%", "75% completion", "video completions 75%"],
+        "required": False,
+        "kind": "percent",
+    },
+    "Video played to 100%": {
+        "aliases": [
+            "video played to 100%", "vcr 100%", "100% completion", "video completions 100%",
+            "video complete", "completion rate", "vcr",
+        ],
+        "required": False,
+        "kind": "percent",
+    },
+    "Unique users": {
+        "aliases": ["unique users", "uu", "reach", "unique reach"],
+        "required": False,
+        "kind": "number",
+    },
+    "Audience": {
+        "aliases": ["audience", "target audience", "demo", "demographic"],
+        "required": False,
+        "kind": "text",
+    },
+}
+
+REQUIRED_COLS = [k for k, v in CANONICAL_SCHEMA.items() if v["required"]]
+
+
+def _normalize_header(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(s).strip().lower()).strip()
+
+
+def suggest_column_mapping(columns: list[str]) -> dict[str, str | None]:
+    """
+    Given the raw column headers from an uploaded file, guess which
+    canonical field each maps to, using exact alias matches first, falling
+    back to substring containment. Returns {canonical_field: actual_column
+    or None}. A column is used for at most one canonical field (first
+    field to claim it wins, in CANONICAL_SCHEMA order).
+    """
+    normalized = {c: _normalize_header(c) for c in columns}
+    claimed = set()
+    mapping = {}
+
+    for field, spec in CANONICAL_SCHEMA.items():
+        alias_set = {_normalize_header(a) for a in spec["aliases"]}
+        match = None
+        # exact normalized match first
+        for col, norm in normalized.items():
+            if col in claimed:
+                continue
+            if norm in alias_set:
+                match = col
+                break
+        # substring fallback
+        if match is None:
+            for col, norm in normalized.items():
+                if col in claimed:
+                    continue
+                if any(alias in norm or norm in alias for alias in alias_set):
+                    match = col
+                    break
+        mapping[field] = match
+        if match:
+            claimed.add(match)
+
+    return mapping
+
+
+def _normalize_bid_strategy(val) -> str:
+    """Map free-text buying-method values to 'Target CPM' / 'Target CPV'."""
+    if pd.isna(val):
+        return np.nan
+    s = str(val).strip().lower()
+    if "cpv" in s:
+        return "Target CPV"
+    if "cpm" in s:
+        return "Target CPM"
+    return str(val).strip()  # unrecognized -- keep as-is, shown to user as a distinct segment
+
+
+def apply_column_mapping(df_raw: pd.DataFrame, mapping: dict[str, str | None]) -> pd.DataFrame:
+    """
+    Rename df_raw's columns to canonical field names per `mapping`
+    ({canonical: actual_column_or_None}), then clean/coerce types
+    according to CANONICAL_SCHEMA. Missing optional fields are created as
+    all-NaN columns so downstream code can rely on their presence.
+    Missing required fields raise ValueError -- check before calling, or
+    let the app catch this.
+    """
+    missing_required = [f for f in REQUIRED_COLS if not mapping.get(f)]
+    if missing_required:
+        raise ValueError(
+            f"Missing required column(s), even after auto-matching: {missing_required}. "
+            "Please map them manually."
+        )
+
+    df = pd.DataFrame(index=df_raw.index)
+    for field, spec in CANONICAL_SCHEMA.items():
+        src_col = mapping.get(field)
+        if src_col and src_col in df_raw.columns:
+            series = df_raw[src_col]
+        else:
+            series = pd.Series([np.nan] * len(df_raw), index=df_raw.index)
+
+        if spec["kind"] == "number":
+            df[field] = series.apply(_clean_number)
+        elif spec["kind"] == "percent":
+            df[field] = series.apply(_clean_percent)
+        else:
+            df[field] = series
+
+    # Bid strategy normalization (CPV -> Target CPV, CPM -> Target CPM)
+    df["Bid strategy type"] = df["Bid strategy type"].apply(_normalize_bid_strategy)
+
+    # Synthesize a Campaign identifier if none was mapped/present
+    if df["Campaign"].isna().all():
+        df["Campaign"] = [f"Campaign {i + 1}" for i in range(len(df))]
+    else:
+        df["Campaign"] = df["Campaign"].fillna(
+            pd.Series([f"Campaign {i + 1}" for i in range(len(df))], index=df.index)
+        )
+
+    # Audience defaults to "All" if not present/mapped
+    df["Audience"] = df["Audience"].fillna("All")
+    df.loc[df["Audience"].astype(str).str.strip() == "", "Audience"] = "All"
+
+    # Drop fully-empty rows (blank trailing lines etc.)
+    df = df.dropna(subset=["Campaign type", "Cost"], how="any")
+
+    return df.reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------
@@ -119,14 +314,14 @@ def _clean_percent(val) -> float:
         return np.nan
 
 
-def load_campaign_csv(file_or_path) -> pd.DataFrame:
+def read_raw_csv(file_or_path) -> pd.DataFrame:
     """
-    Load a raw Google-Ads-style campaign report export and return a fully
-    cleaned dataframe with numeric types.
-
-    Accepts a path, a file-like object, or raw bytes/str content.
-    Automatically detects and skips the "Campaign report" title + date
-    rows that precede the real header if present.
+    Read a CSV that may have a title/date preamble before the real header
+    row (common in ad-platform exports), without assuming any particular
+    column names. Detects the header row by finding the row within the
+    first 15 lines whose fields best match known canonical-field aliases.
+    Returns the raw dataframe with original (stripped) column headers --
+    no cleaning or renaming applied yet.
     """
     if isinstance(file_or_path, (bytes, bytearray)):
         raw_text = file_or_path.decode("utf-8", errors="replace")
@@ -137,55 +332,43 @@ def load_campaign_csv(file_or_path) -> pd.DataFrame:
         with open(file_or_path, "r", encoding="utf-8", errors="replace") as f:
             raw_text = f.read()
 
-    # Detect and skip a title/date preamble (e.g. "Campaign report" /
-    # "July 27, 2026 - August 5, 2026") that precedes the real header row.
     lines = raw_text.splitlines()
-    skiprows = 0
-    found_header = False
-    for line in lines[:10]:
-        if line.strip().startswith("Campaign,") or "Budget type" in line:
-            found_header = True
-            break
-        skiprows += 1
-    if not found_header:
-        skiprows = 0  # header not found in first 10 lines; assume no preamble
+    all_aliases = {
+        _normalize_header(a) for spec in CANONICAL_SCHEMA.values() for a in spec["aliases"]
+    }
+
+    def score(line: str) -> int:
+        fields = [_normalize_header(f) for f in line.split(",")]
+        return sum(1 for f in fields if f in all_aliases)
+
+    best_idx, best_score = 0, -1
+    for i, line in enumerate(lines[:15]):
+        s = score(line)
+        if s > best_score:
+            best_score, best_idx = s, i
+
+    skiprows = best_idx if best_score >= 2 else 0  # need at least 2 recognizable headers to trust it
 
     buf = io.StringIO(raw_text)
     df = pd.read_csv(buf, skiprows=skiprows)
     df = df.dropna(axis=1, how="all")
-    df.columns = [c.strip() for c in df.columns]
-
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        raise ValueError(
-            f"Uploaded file is missing required columns: {missing}. "
-            f"Found columns: {list(df.columns)}"
-        )
-
-    # Clean numeric / comma-formatted columns
-    for col in THOUSANDS_COLS + NUMERIC_COLS:
-        if col in df.columns:
-            df[col] = df[col].apply(_clean_number)
-
-    # Clean percentage columns
-    for col in PERCENT_COLS:
-        if col in df.columns:
-            df[col] = df[col].apply(_clean_percent)
-
-    # Drop fully-empty rows (can happen with trailing blank lines)
-    df = df.dropna(subset=["Campaign", "Cost"], how="any")
-
-    # Audience is an optional column. If the file doesn't have one (most
-    # exports won't), default every campaign to "All" -- the app lets the
-    # user tag individual campaigns with a real audience afterwards.
-    audience_col = next((c for c in df.columns if c.strip().lower() in ("audience", "target audience")), None)
-    if audience_col:
-        df = df.rename(columns={audience_col: "Audience"})
-        df["Audience"] = df["Audience"].fillna("All")
-    else:
-        df["Audience"] = "All"
-
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(how="all")  # drop fully blank rows
     return df.reset_index(drop=True)
+
+
+def load_campaign_csv(file_or_path, mapping_override: dict[str, str | None] | None = None) -> pd.DataFrame:
+    """
+    Convenience one-shot loader: reads the file, auto-suggests a column
+    mapping (or uses `mapping_override` if given), applies it, and returns
+    the fully cleaned canonical dataframe. Raises ValueError if a required
+    field couldn't be mapped -- for a friendlier flow, use read_raw_csv() +
+    suggest_column_mapping() + apply_column_mapping() directly so the app
+    can show the user a mapping UI instead of failing outright.
+    """
+    df_raw = read_raw_csv(file_or_path)
+    mapping = mapping_override or suggest_column_mapping(df_raw.columns.tolist())
+    return apply_column_mapping(df_raw, mapping)
 
 
 # --------------------------------------------------------------------------

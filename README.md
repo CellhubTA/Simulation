@@ -29,6 +29,38 @@ running the app on **3.11 or 3.12** for now. If you specifically need 3.14
 check current compatibility and adjust — but there's no functional reason
 this app needs 3.14.
 
+## New: flexible CSV uploads + built-in historical data
+
+**You no longer need to re-upload data every time.** The app ships with a
+built-in dataset (`data/historical_data.csv`) that loads automatically on
+startup — just open the app and start simulating. Uploading a file is now
+optional, under "➕ Add more historical data" in the sidebar, and it *adds*
+to the built-in data rather than replacing it.
+
+**Any reasonably-shaped CSV works now**, not just the exact Google Ads
+export format. The app only strictly requires four things to exist
+somewhere in your file (under any name):
+- **Campaign type** (or "Partner", "Channel", "Platform", etc.)
+- **Cost** (or "Gross Budget", "Spend", "Budget", etc.)
+- **Bid strategy** (or "Buying Method" — "CPV"/"CPM" are auto-normalized
+  to "Target CPV"/"Target CPM")
+- **Impressions** (or "Impr.")
+
+Everything else (Clicks, CTR, Views, video-completion breakdown, Unique
+users, Currency code, Campaign name) is optional — if your file doesn't
+have it, that just means fewer benchmark rates come out of it, not an
+error. When you upload a file, the app shows you its best-guess column
+mapping so you can correct it before confirming, and if there's no
+currency column at all, it asks you once which currency the whole file is
+in.
+
+**To make new data permanent**: after merging an upload, use "⬇️ Download
+current historical dataset" in the sidebar, then replace
+`data/historical_data.csv` in your GitHub repo with the downloaded file
+and push. Since Streamlit Cloud's filesystem resets between deploys,
+merges you make *in the running app* only last for that session unless you
+do this — the download button exists specifically for that reason.
+
 ## New: multiple currencies (VND, KRW, JPY, USD)
 
 The sidebar now has a **Target currency** dropdown (VND, KRW, JPY, or USD)
@@ -149,6 +181,7 @@ Then open the local URL Streamlit prints (usually `http://localhost:8501`).
 
 | File | Purpose |
 |---|---|
+| `data/historical_data.csv` | Built-in historical dataset, loaded automatically on startup |
 | `app.py` | Streamlit UI |
 | `data_utils.py` | CSV cleaning, currency conversion, benchmark rate computation |
 | `simulator.py` | Budget→Results and Target→Budget projection logic |
