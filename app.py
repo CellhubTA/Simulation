@@ -10,8 +10,6 @@ Run with:
     streamlit run app.py
 """
 
-import os
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -20,9 +18,6 @@ import data_utils as du
 import simulator as sim
 
 st.set_page_config(page_title="Campaign Simulation Tool", layout="wide")
-
-MASTER_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "historical_data.csv")
-CANONICAL_COLS = list(du.CANONICAL_SCHEMA.keys())
 
 
 # --------------------------------------------------------------------------
@@ -67,98 +62,10 @@ if not check_password():
 # Sidebar: data upload + currency settings
 # --------------------------------------------------------------------------
 
-st.sidebar.header("1. Historical data")
-
-# The app ships with a built-in historical dataset (data/historical_data.csv)
-# that loads automatically -- no need to upload anything to just run a
-# simulation. Uploading a file *adds* to it for this session; use the
-# download button to save the merged result and commit it back to your
-# repo's data/historical_data.csv if you want it to persist permanently.
-if "master_df" not in st.session_state:
-    if os.path.exists(MASTER_DATA_PATH):
-        base_df = pd.read_csv(MASTER_DATA_PATH)
-        for col in CANONICAL_COLS:
-            if col not in base_df.columns:
-                base_df[col] = np.nan
-    else:
-        base_df = pd.DataFrame(columns=CANONICAL_COLS)
-    st.session_state["master_df"] = base_df
-
-st.sidebar.caption(
-    f"📁 Built-in dataset: **{len(st.session_state['master_df'])} historical campaigns** loaded. "
-    "No upload needed to run a simulation."
+st.sidebar.header("1. Upload historical data")
+uploaded_file = st.sidebar.file_uploader(
+    "Campaign report CSV", type=["csv"], help="Google Ads / DV360-style campaign export"
 )
-
-with st.sidebar.expander("➕ Add more historical data"):
-    uploaded_file = st.file_uploader(
-        "Any campaign report CSV", type=["csv"],
-        help="Any export with columns roughly matching Campaign type, Cost, Bid strategy, Impressions -- "
-             "column names don't need to match exactly, you'll get to confirm the mapping.",
-    )
-
-    if uploaded_file is not None:
-        try:
-            df_raw = du.read_raw_csv(uploaded_file)
-        except Exception as e:
-            st.error(f"Couldn't read this file: {e}")
-            df_raw = None
-
-        if df_raw is not None:
-            if "auto_mapping" not in st.session_state or st.session_state.get("mapped_file_name") != uploaded_file.name:
-                st.session_state["auto_mapping"] = du.suggest_column_mapping(df_raw.columns.tolist())
-                st.session_state["mapped_file_name"] = uploaded_file.name
-
-            st.caption("Confirm how columns in your file map to what the app needs. Required fields are marked *.")
-            mapping = {}
-            col_options = ["(none)"] + df_raw.columns.tolist()
-            for field, spec in du.CANONICAL_SCHEMA.items():
-                label = f"{field}{' *' if spec['required'] else ''}"
-                current = st.session_state["auto_mapping"].get(field)
-                default_idx = col_options.index(current) if current in col_options else 0
-                choice = st.selectbox(label, col_options, index=default_idx, key=f"map_{field}")
-                mapping[field] = None if choice == "(none)" else choice
-
-            missing_required = [f for f in du.REQUIRED_COLS if not mapping.get(f)]
-            if missing_required:
-                st.warning(f"Still need to map: {missing_required}")
-            else:
-                if st.button("Add to historical dataset"):
-                    try:
-                        new_df = du.apply_column_mapping(df_raw, mapping)
-                        # If the file has no currency info at all, ask separately below
-                        st.session_state["pending_new_data"] = new_df
-                        st.success(f"Parsed {len(new_df)} campaign(s) -- review below, then confirm merge.")
-                    except Exception as e:
-                        st.error(f"Couldn't parse with this mapping: {e}")
-
-    if "pending_new_data" in st.session_state:
-        pending = st.session_state["pending_new_data"]
-        st.dataframe(pending[["Campaign", "Campaign type", "Bid strategy type", "Cost", "Impr.", "Currency code"]], use_container_width=True)
-
-        if pending["Currency code"].isna().all():
-            fallback_cur = st.selectbox(
-                "This file doesn't specify a currency -- what currency is it in?",
-                du.SUPPORTED_CURRENCIES,
-                key="pending_currency",
-            )
-            pending = pending.copy()
-            pending["Currency code"] = fallback_cur
-
-        if st.button("✅ Confirm merge into historical dataset"):
-            st.session_state["master_df"] = pd.concat(
-                [st.session_state["master_df"], pending], ignore_index=True
-            )
-            del st.session_state["pending_new_data"]
-            st.success("Merged. The simulation below now includes this data.")
-            st.rerun()
-
-    st.download_button(
-        "⬇️ Download current historical dataset (CSV)",
-        st.session_state["master_df"].to_csv(index=False),
-        file_name="historical_data.csv",
-        mime="text/csv",
-        help="Save this and replace data/historical_data.csv in your GitHub repo to make it the new default.",
-    )
 
 CURRENCY_SYMBOLS = {"VND": "₫", "KRW": "₩", "JPY": "¥", "USD": "$"}
 
@@ -172,10 +79,23 @@ st.caption(
     "based on your historical channel performance."
 )
 
-raw_df = st.session_state["master_df"]
+if uploaded_file is None:
+    st.info("👈 Upload a historical campaign report CSV in the sidebar to get started.")
+    st.markdown(
+        """
+        **Expected format:** a Google Ads / DV360-style campaign report export with columns such as
+        `Campaign`, `Currency code`, `Campaign type`, `Cost`, `Bid strategy type`, `Impr.`,
+        `TrueView views`, `Avg. CPM`, `Clicks`, `CTR`, `Video played to 25/50/75/100%`, `Unique users`.
+        Supported source currencies: VND, KRW, JPY, USD -- a file can even mix
+        several (each row is converted using its own `Currency code`).
+        """
+    )
+    st.stop()
 
-if raw_df.empty:
-    st.info("👈 No historical data yet -- add a CSV in the sidebar to get started.")
+try:
+    raw_df = du.load_campaign_csv(uploaded_file)
+except Exception as e:
+    st.error(f"Couldn't read this file: {e}")
     st.stop()
 
 # --------------------------------------------------------------------------
@@ -248,25 +168,34 @@ st.sidebar.caption(
 # --------------------------------------------------------------------------
 st.subheader("Tag each campaign with a target audience")
 st.caption(
-    "Edit the Audience column directly. Benchmarks and simulations split by "
-    "audience too. Leave as 'All' if a campaign wasn't audience-targeted."
+    "Your file doesn't include an audience column, so tag campaigns here. "
+    "Benchmarks and simulations will then be split by audience too. "
+    "Leave as 'All' if a campaign wasn't audience-targeted."
 )
 
+if "audience_tags" not in st.session_state:
+    st.session_state["audience_tags"] = raw_df[["Campaign"]].copy()
+    st.session_state["audience_tags"]["Audience"] = raw_df["Audience"]
+
 edited_tags = st.data_editor(
-    raw_df[["Campaign", "Campaign type", "Audience"]],
+    st.session_state["audience_tags"],
     column_config={
         "Audience": st.column_config.SelectboxColumn(
             "Audience", options=du.AUDIENCE_OPTIONS, required=True
         ),
         "Campaign": st.column_config.TextColumn("Campaign", disabled=True),
-        "Campaign type": st.column_config.TextColumn("Campaign type", disabled=True),
     },
     hide_index=True,
     use_container_width=True,
-    key=f"audience_editor_{len(raw_df)}",
+    key="audience_editor",
 )
-st.session_state["master_df"].loc[edited_tags.index, "Audience"] = edited_tags["Audience"].values
-raw_df = st.session_state["master_df"]
+st.session_state["audience_tags"] = edited_tags
+
+raw_df = raw_df.merge(
+    edited_tags.rename(columns={"Audience": "Audience_tagged"}), on="Campaign", how="left"
+)
+raw_df["Audience"] = raw_df["Audience_tagged"].fillna(raw_df["Audience"])
+raw_df = raw_df.drop(columns=["Audience_tagged"])
 
 sym = CURRENCY_SYMBOLS.get(target_currency, target_currency + " ")
 
