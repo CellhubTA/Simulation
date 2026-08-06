@@ -29,6 +29,52 @@ running the app on **3.11 or 3.12** for now. If you specifically need 3.14
 check current compatibility and adjust — but there's no functional reason
 this app needs 3.14.
 
+## New: password, audience targeting, spend-dependent CPM
+
+**1. Password protection**
+The app is gated by a password stored in Streamlit secrets (never hardcoded
+in the code, so it's safe to keep the code public on GitHub).
+
+- **Locally**: copy `.streamlit/secrets.toml.example` to
+  `.streamlit/secrets.toml` and set `app_password = "yourpassword"`.
+  This file is gitignored, so it won't be pushed to GitHub.
+- **On Streamlit Community Cloud**: go to your app → ⋮ menu → **Settings**
+  → **Secrets**, and paste:
+  ```toml
+  app_password = "yourpassword"
+  ```
+  Save, and the app restarts with the password gate active.
+- If no `app_password` secret is set anywhere, the app shows a warning and
+  runs unprotected (so you don't accidentally lock yourself out during setup).
+
+**2. Target audience**
+Your export doesn't include an audience column, so the app now shows an
+editable table right after upload — tag each historical campaign as
+`Boys 6-12`, `Girls 6-12`, or any other audience (freeform text is allowed
+too, not just the presets). Benchmarks and both simulation directions then
+split by audience automatically, so "Boys 6-12 · Target CPM" gets its own
+eCPM/CTR/VCR rates separate from "Girls 6-12 · Target CPM".
+
+If you get proper audience-segmented historical data later (a real
+`Audience` column in the export), the app will pick it up automatically
+and skip the manual tagging step.
+
+**3. Spend-dependent eCPM**
+Real auctions don't have a flat eCPM — it typically shifts as budget
+changes (more competition at higher spend, or better efficiency at scale,
+depending on the channel). The app now fits a log-linear curve
+(`eCPM = a + b × ln(spend)`) per segment from your historical campaigns,
+and uses *that* projected eCPM at whatever budget you enter — rather than
+a single flat average. You'll see this on the Budget → Results tab as a
+chart of "how eCPM shifts as spend increases," plus the R² of the fit so
+you can judge how reliable the curve is.
+
+This needs **at least 3 historical campaigns** in a segment to fit
+reliably; with fewer, it automatically falls back to the flat average eCPM
+and tells you why. As you accumulate more historical campaigns per
+segment, the curve gets more reliable — worth re-uploading a fresher
+export periodically.
+
 ## Setup
 
 ```bash

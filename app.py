@@ -19,6 +19,45 @@ import simulator as sim
 
 st.set_page_config(page_title="Campaign Simulation Tool", layout="wide")
 
+
+# --------------------------------------------------------------------------
+# Password gate
+# --------------------------------------------------------------------------
+def check_password() -> bool:
+    """
+    Simple password gate using st.secrets. Add a secret named
+    `app_password` (see README for how to set this locally and on
+    Streamlit Community Cloud). If no secret is configured, the app
+    warns and runs unprotected rather than locking everyone out.
+    """
+    configured_password = st.secrets.get("app_password", None)
+    if not configured_password:
+        st.warning(
+            "⚠️ No password is configured for this app (missing `app_password` in secrets). "
+            "Running without a password gate -- see README to set one up.",
+            icon="⚠️",
+        )
+        return True
+
+    def _on_submit():
+        if st.session_state.get("password_input") == configured_password:
+            st.session_state["password_ok"] = True
+        else:
+            st.session_state["password_ok"] = False
+
+    if st.session_state.get("password_ok"):
+        return True
+
+    st.title("🔒 Campaign Simulation Tool")
+    st.text_input("Password", type="password", key="password_input", on_change=_on_submit)
+    if st.session_state.get("password_ok") is False:
+        st.error("Incorrect password.")
+    return False
+
+
+if not check_password():
+    st.stop()
+
 # --------------------------------------------------------------------------
 # Sidebar: data upload + currency settings
 # --------------------------------------------------------------------------
@@ -88,6 +127,40 @@ except Exception as e:
     st.error(f"Couldn't read this file: {e}")
     st.stop()
 
+# --------------------------------------------------------------------------
+# Audience tagging
+# --------------------------------------------------------------------------
+st.subheader("Tag each campaign with a target audience")
+st.caption(
+    "Your file doesn't include an audience column, so tag campaigns here. "
+    "Benchmarks and simulations will then be split by audience too. "
+    "Leave as 'All' if a campaign wasn't audience-targeted."
+)
+
+if "audience_tags" not in st.session_state:
+    st.session_state["audience_tags"] = raw_df[["Campaign"]].copy()
+    st.session_state["audience_tags"]["Audience"] = raw_df["Audience"]
+
+edited_tags = st.data_editor(
+    st.session_state["audience_tags"],
+    column_config={
+        "Audience": st.column_config.SelectboxColumn(
+            "Audience", options=du.AUDIENCE_OPTIONS, required=True
+        ),
+        "Campaign": st.column_config.TextColumn("Campaign", disabled=True),
+    },
+    hide_index=True,
+    use_container_width=True,
+    key="audience_editor",
+)
+st.session_state["audience_tags"] = edited_tags
+
+raw_df = raw_df.merge(
+    edited_tags.rename(columns={"Audience": "Audience_tagged"}), on="Campaign", how="left"
+)
+raw_df["Audience"] = raw_df["Audience_tagged"].fillna(raw_df["Audience"])
+raw_df = raw_df.drop(columns=["Audience_tagged"])
+
 df_jpy = du.add_jpy_columns(raw_df, fx_rate, cost_currency=source_currency)
 benchmarks = du.compute_benchmarks(df_jpy)
 
@@ -95,7 +168,9 @@ if benchmarks.empty:
     st.error("No usable rows found after cleaning -- check the uploaded file.")
     st.stop()
 
-benchmarks["segment_label"] = benchmarks["segment"] + " · " + benchmarks["bid_strategy"]
+benchmarks["segment_label"] = (
+    benchmarks["segment"] + " · " + benchmarks["bid_strategy"] + " · " + benchmarks["audience"]
+)
 
 tab_data, tab_budget, tab_target, tab_planner = st.tabs(
     ["📁 Historical Data & Benchmarks", "💰 Budget → Results", "🎯 Target → Budget", "🧮 Multi-Channel Planner"]
@@ -161,6 +236,27 @@ with tab_budget:
     r3.metric("CPV", f"¥{result.cpv_jpy:,.2f}" if pd.notna(result.cpv_jpy) else "n/a")
     r4.metric("CPCV", f"¥{result.cpcv_jpy:,.2f}" if pd.notna(result.cpcv_jpy) else "n/a")
 
+    st.markdown("### How eCPM shifts as spend increases")
+    if row.get("has_ecpm_curve"):
+        st.caption(
+            f"Fitted from {int(row['n_campaigns'])} historical campaigns in this segment "
+            f"(R² = {row['ecpm_curve_r2']:.2f}). Curve: eCPM = {row['ecpm_curve_intercept']:.2f} "
+            f"+ {row['ecpm_curve_slope']:.2f} × ln(budget)."
+        )
+    else:
+        st.caption(
+            f"Only {int(row['n_campaigns'])} historical campaign(s) in this segment -- "
+            "need 3+ to reliably model how eCPM changes with spend, so this shows a flat rate."
+        )
+    budget_range = np.linspace(max(budget_input * 0.2, 1000), budget_input * 3, 30)
+    curve_df = pd.DataFrame(
+        {
+            "Budget (JPY)": budget_range,
+            "Projected eCPM (JPY)": [du.project_ecpm(row.to_dict(), b) for b in budget_range],
+        }
+    ).set_index("Budget (JPY)")
+    st.line_chart(curve_df)
+
 # --------------------------------------------------------------------------
 # TAB: Target -> Budget
 # --------------------------------------------------------------------------
@@ -208,7 +304,7 @@ with tab_planner:
     for i, (_, r) in enumerate(benchmarks.iterrows()):
         with cols[i % len(cols)]:
             pct = st.slider(r["segment_label"], 0, 100, int(100 / len(benchmarks)), key=f"alloc_{i}")
-            alloc_pcts[(r["segment"], r["bid_strategy"])] = pct / 100.0
+            alloc_pcts[(r["segment"], r["bid_strategy"], r["audience"])] = pct / 100.0
 
     total_pct = sum(alloc_pcts.values()) * 100
     if abs(total_pct - 100) > 0.01:

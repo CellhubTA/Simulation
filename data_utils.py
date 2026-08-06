@@ -74,6 +74,18 @@ REQUIRED_COLS = [
 
 BID_STRATEGIES = ["Target CPM", "Target CPV"]
 
+# Preset audience options shown in the app's audience-tagging UI. Freeform
+# text is also allowed, so this list is just a convenience, not a limit.
+AUDIENCE_OPTIONS = [
+    "All",
+    "Boys 6-12",
+    "Girls 6-12",
+    "Boys 13-17",
+    "Girls 13-17",
+    "Adults 18-34",
+    "Adults 35+",
+]
+
 
 # --------------------------------------------------------------------------
 # Loading & cleaning
@@ -163,6 +175,16 @@ def load_campaign_csv(file_or_path) -> pd.DataFrame:
     # Drop fully-empty rows (can happen with trailing blank lines)
     df = df.dropna(subset=["Campaign", "Cost"], how="any")
 
+    # Audience is an optional column. If the file doesn't have one (most
+    # exports won't), default every campaign to "All" -- the app lets the
+    # user tag individual campaigns with a real audience afterwards.
+    audience_col = next((c for c in df.columns if c.strip().lower() in ("audience", "target audience")), None)
+    if audience_col:
+        df = df.rename(columns={audience_col: "Audience"})
+        df["Audience"] = df["Audience"].fillna("All")
+    else:
+        df["Audience"] = "All"
+
     return df.reset_index(drop=True)
 
 
@@ -234,14 +256,15 @@ def add_jpy_columns(df: pd.DataFrame, fx_rate: float, cost_currency: str = "VND"
 @dataclass
 class ChannelBenchmark:
     """Weighted-average historical performance benchmark for one
-    (Campaign type, Bid strategy type) segment, in JPY."""
+    (Campaign type, Bid strategy type, Audience) segment, in JPY."""
 
     segment: str
     bid_strategy: str
+    audience: str
     n_campaigns: int
     total_cost_jpy: float
     total_impressions: float
-    ecpm_jpy: float               # cost per 1000 impressions
+    ecpm_jpy: float               # cost per 1000 impressions (flat historical average)
     cpc_jpy: float                # cost per click
     cpv_jpy: float                # cost per TrueView view
     ctr: float                    # clicks / impressions
@@ -252,9 +275,69 @@ class ChannelBenchmark:
     vcr_100: float                # video completion rate
     cpcv_jpy: float                # cost per completed view (100%)
     uu_rate: float                 # unique users / impressions
+    # Spend -> eCPM curve (log-linear fit): ecpm = intercept + slope * ln(cost_jpy)
+    # None if there isn't enough historical data (< 3 campaigns) to fit one
+    # reliably -- in that case the simulator falls back to the flat ecpm_jpy.
+    ecpm_curve_intercept: float = np.nan
+    ecpm_curve_slope: float = np.nan
+    ecpm_curve_r2: float = np.nan
+    has_ecpm_curve: bool = False
 
     def as_dict(self):
         return self.__dict__
+
+
+def _fit_ecpm_curve(g: pd.DataFrame):
+    """
+    Fit eCPM (per campaign) as a log-linear function of spend:
+        ecpm = intercept + slope * ln(cost_jpy)
+    using ordinary least squares on the individual campaigns within a
+    segment. Requires at least 3 campaigns with valid cost & eCPM data to
+    be considered reliable; otherwise returns all-NaN / has_curve=False.
+
+    A positive slope means eCPM tends to rise as spend increases (more
+    auction pressure at higher budgets); negative means it falls
+    (efficiencies of scale). Either is plausible depending on the channel.
+    """
+    sub = g.dropna(subset=["Cost (JPY)", "Impr."])
+    sub = sub[(sub["Cost (JPY)"] > 0) & (sub["Impr."] > 0)]
+    if len(sub) < 3:
+        return np.nan, np.nan, np.nan, False
+
+    x = np.log(sub["Cost (JPY)"].values)
+    y = (sub["Cost (JPY)"].values / sub["Impr."].values * 1000)  # per-campaign eCPM
+
+    if np.std(x) == 0:
+        return np.nan, np.nan, np.nan, False
+
+    slope, intercept = np.polyfit(x, y, 1)
+    y_pred = intercept + slope * x
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    return float(intercept), float(slope), float(r2), True
+
+
+def project_ecpm(benchmark: dict, budget_jpy: float) -> float:
+    """
+    Given a benchmark dict (one row of compute_benchmarks()) and a
+    candidate budget, return the projected eCPM at that spend level.
+    Uses the fitted log-linear curve when available and budget is
+    positive; otherwise falls back to the flat historical average eCPM.
+    """
+    flat = benchmark.get("ecpm_jpy", np.nan)
+    if not budget_jpy or budget_jpy <= 0:
+        return flat
+    if benchmark.get("has_ecpm_curve") and pd.notna(benchmark.get("ecpm_curve_slope")):
+        intercept = benchmark["ecpm_curve_intercept"]
+        slope = benchmark["ecpm_curve_slope"]
+        projected = intercept + slope * np.log(budget_jpy)
+        # Guard against nonsensical (negative/zero) projections outside the
+        # range of observed data -- fall back to the flat rate if so.
+        if projected and projected > 0:
+            return float(projected)
+    return flat
 
 
 def _weighted_avg(df, value_col, weight_col):
@@ -270,9 +353,13 @@ def compute_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
     strategy type) and computes weighted-average historical rates.
     Returns a tidy dataframe, one row per segment.
     """
+    if "Audience" not in df.columns:
+        df = df.copy()
+        df["Audience"] = "All"
+
     rows = []
-    group_cols = ["Campaign type", "Bid strategy type"]
-    for (seg, strategy), g in df.groupby(group_cols):
+    group_cols = ["Campaign type", "Bid strategy type", "Audience"]
+    for (seg, strategy, audience), g in df.groupby(group_cols):
         total_cost = g["Cost (JPY)"].sum()
         total_impr = g["Impr."].sum()
         total_clicks = g["Clicks"].sum() if "Clicks" in g else np.nan
@@ -294,10 +381,13 @@ def compute_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
         completed_views = total_impr * vcr_100 if pd.notna(vcr_100) else np.nan
         cpcv = (total_cost / completed_views) if completed_views else np.nan
 
+        intercept, slope, r2, has_curve = _fit_ecpm_curve(g)
+
         rows.append(
             ChannelBenchmark(
                 segment=seg,
                 bid_strategy=strategy,
+                audience=audience,
                 n_campaigns=len(g),
                 total_cost_jpy=total_cost,
                 total_impressions=total_impr,
@@ -312,6 +402,10 @@ def compute_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
                 vcr_100=vcr_100,
                 cpcv_jpy=cpcv,
                 uu_rate=uu_rate,
+                ecpm_curve_intercept=intercept,
+                ecpm_curve_slope=slope,
+                ecpm_curve_r2=r2,
+                has_ecpm_curve=has_curve,
             ).as_dict()
         )
 

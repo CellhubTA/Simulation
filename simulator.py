@@ -23,6 +23,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+import pandas as pd
+
+import data_utils as du
 
 TARGETABLE_METRICS = [
     "Impressions",
@@ -71,7 +74,7 @@ def simulate_from_budget(benchmark: dict, budget_jpy: float) -> ProjectionResult
     strategy = benchmark.get("bid_strategy", "Target CPM")
     warnings = []
 
-    ecpm = benchmark.get("ecpm_jpy", np.nan)
+    ecpm = benchmark.get("ecpm_jpy", np.nan)  # flat historical average (fallback)
     cpv = benchmark.get("cpv_jpy", np.nan)
     ctr = benchmark.get("ctr", np.nan)
     view_rate = benchmark.get("view_rate", np.nan)
@@ -81,13 +84,25 @@ def simulate_from_budget(benchmark: dict, budget_jpy: float) -> ProjectionResult
     vcr_100 = benchmark.get("vcr_100", np.nan)
     uu_rate = benchmark.get("uu_rate", np.nan)
 
+    # eCPM is spend-dependent: use the fitted spend->eCPM curve when the
+    # segment has enough historical data points, otherwise fall back to
+    # the flat weighted-average eCPM.
+    ecpm_at_budget = du.project_ecpm(benchmark, budget_jpy)
+    if benchmark.get("has_ecpm_curve") and pd.notna(benchmark.get("ecpm_curve_slope")):
+        pass  # curve used silently -- no warning needed, this is expected behavior
+    elif ecpm_at_budget is None or (isinstance(ecpm_at_budget, float) and np.isnan(ecpm_at_budget)):
+        warnings.append(
+            "Not enough historical campaigns (need 3+) to model how eCPM shifts with "
+            "spend for this segment -- using the flat historical average eCPM instead."
+        )
+
     if strategy == "Target CPV":
         if not cpv or np.isnan(cpv):
             warnings.append(
                 "No historical Target CPV data for this segment -- "
                 "falling back to Target CPM-derived eCPM to estimate impressions."
             )
-            impressions = (budget_jpy / ecpm * 1000) if ecpm else np.nan
+            impressions = (budget_jpy / ecpm_at_budget * 1000) if ecpm_at_budget else np.nan
             trueview_views = impressions * view_rate if view_rate else np.nan
         else:
             trueview_views = budget_jpy / cpv
@@ -99,11 +114,11 @@ def simulate_from_budget(benchmark: dict, budget_jpy: float) -> ProjectionResult
                     "No historical view-rate available; impressions could not be derived."
                 )
     else:  # Target CPM (default)
-        if not ecpm or np.isnan(ecpm):
+        if not ecpm_at_budget or np.isnan(ecpm_at_budget):
             warnings.append("No historical Target CPM data for this segment.")
             impressions = np.nan
         else:
-            impressions = budget_jpy / ecpm * 1000
+            impressions = budget_jpy / ecpm_at_budget * 1000
         trueview_views = impressions * view_rate if (view_rate and impressions) else np.nan
 
     clicks = impressions * ctr if (ctr and impressions) else np.nan
@@ -179,7 +194,11 @@ def simulate_from_target(benchmark: dict, target_metric: str, target_value: floa
         )
         impressions = np.nan
 
-    # Step 2: convert impressions into required budget under the bid strategy
+    # Step 2: convert impressions into required budget under the bid strategy.
+    # eCPM is spend-dependent (see project_ecpm), so for Target CPM this is a
+    # fixed-point problem: budget depends on eCPM, which depends on budget.
+    # A few iterations of re-projecting eCPM at the current budget estimate
+    # converges quickly for the log-linear curve used here.
     if strategy == "Target CPV":
         if cpv and not np.isnan(cpv) and view_rate:
             trueview_views = impressions * view_rate
@@ -190,7 +209,17 @@ def simulate_from_target(benchmark: dict, target_metric: str, target_value: floa
             )
             budget = impressions / 1000 * ecpm if ecpm else np.nan
     else:
-        budget = impressions / 1000 * ecpm if ecpm else np.nan
+        budget = impressions / 1000 * ecpm if ecpm else np.nan  # initial guess using flat rate
+        if budget and not np.isnan(budget):
+            for _ in range(5):
+                ecpm_iter = du.project_ecpm(benchmark, budget)
+                if not ecpm_iter or np.isnan(ecpm_iter):
+                    break
+                new_budget = impressions / 1000 * ecpm_iter
+                if abs(new_budget - budget) < 1:  # converged to within 1 JPY
+                    budget = new_budget
+                    break
+                budget = new_budget
 
     result = simulate_from_budget(benchmark, budget if budget and not np.isnan(budget) else np.nan)
     result.warnings = warnings + result.warnings
@@ -203,8 +232,8 @@ def allocate_budget_across_segments(
     allocations: dict,
 ) -> list[ProjectionResult]:
     """
-    allocations: dict mapping a (Campaign type, Bid strategy type) tuple
-    (or a row index into benchmarks_df) to a percentage (0-1) of total budget.
+    allocations: dict mapping a (Campaign type, Bid strategy type, Audience)
+    tuple to a percentage (0-1) of total budget.
     Returns a list of ProjectionResult, one per allocated segment.
     """
     results = []
@@ -212,7 +241,9 @@ def allocate_budget_across_segments(
         if pct <= 0:
             continue
         row = benchmarks_df.loc[
-            (benchmarks_df["segment"] == key[0]) & (benchmarks_df["bid_strategy"] == key[1])
+            (benchmarks_df["segment"] == key[0])
+            & (benchmarks_df["bid_strategy"] == key[1])
+            & (benchmarks_df["audience"] == key[2])
         ]
         if row.empty:
             continue
@@ -221,5 +252,6 @@ def allocate_budget_across_segments(
         res = simulate_from_budget(benchmark, seg_budget)
         res_dict = res.as_dict()
         res_dict["segment"] = key[0]
+        res_dict["audience"] = key[2]
         results.append(res_dict)
     return results
